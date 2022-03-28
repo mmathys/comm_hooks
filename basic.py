@@ -14,6 +14,17 @@ def example(rank, world_size):
     model = nn.Linear(10, 10).to(rank)
     # construct DDP model
     ddp_model = DDP(model, device_ids=[rank])
+    def encode_and_decode(state: object, bucket: dist.GradBucket):
+        group_to_use = dist.group.WORLD
+        encoded_tensor = bucket.buffer() # encode gradients
+        fut = dist.all_reduce(encoded_tensor, group=group_to_use, async_op=True).get_future()
+        # Define the then callback to decode.
+        def decode(fut):
+            decoded_tensor = fut.value()[0] # decode gradients
+            return decoded_tensor
+        return fut.then(decode)
+    breakpoint()
+    ddp_model.register_comm_hook(state=None, hook=encode_and_decode)
     # define loss function and optimizer
     loss_fn = nn.MSELoss()
     optimizer = optim.SGD(ddp_model.parameters(), lr=0.001)
@@ -27,7 +38,7 @@ def example(rank, world_size):
     optimizer.step()
 
 def main():
-    world_size = 2
+    world_size = 1
     mp.spawn(example,
         args=(world_size,),
         nprocs=world_size,
