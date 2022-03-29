@@ -20,7 +20,7 @@ class SketchState:
         self.u = torch.zeros(grad_shape, device=device)
         self.v = torch.zeros(grad_shape, device=device)
         self.momentum = momentum
-        self.sketch = CSVec(d=grad_shape, c=c, r=r)
+        self.sketch = CSVec(d=grad_shape, c=c, r=r, device=device)
         self.k = k
 
     def encode(self, gradient):
@@ -42,13 +42,18 @@ class SketchState:
 
         return gradient
 
-def example(rank, world_size):
-    # create default process group
+def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def example(rank, world_size, device="cpu"):
+    setup(rank, world_size)
+    print(f"init rank {rank}")
     # create local model
-    model = nn.Linear(10, 10).to(rank)
+    model = nn.Linear(10, 10)
     # construct DDP model
-    ddp_model = DDP(model, device_ids=[rank])
+    ddp_model = DDP(model)
 
     # Define a encode-decode hook for the gradient bucket.
     # The GradientBucket.buffer returns the gradient vector of the whole network.
@@ -70,12 +75,12 @@ def example(rank, world_size):
         return fut.then(decode_fut)
     
     # initialize the state 
-    state = SketchState(model, device=rank)
+    state = SketchState(model, device=device)
     ddp_model.register_comm_hook(state=state, hook=encode_and_decode)
 
     # prepare sample dataset
-    X = torch.randn(20, 10).to(rank)
-    y = torch.randn(20, 10).to(rank)
+    X = torch.randn(20, 10)
+    y = torch.randn(20, 10)
 
     # define loss function and optimizer
     loss_fn = nn.MSELoss()
@@ -99,14 +104,11 @@ def example(rank, world_size):
         optimizer.step()
 
 def main():
-    world_size = 1
+    world_size = 2
     mp.spawn(example,
         args=(world_size,),
         nprocs=world_size,
         join=True)
 
 if __name__=="__main__":
-    # Environment variables which need to be set
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
     main()
