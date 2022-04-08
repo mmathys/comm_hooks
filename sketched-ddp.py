@@ -11,17 +11,43 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Implements SketchSGD encoding and decoding. This is can be used for the stateful
 # hook.
 class SketchState:
-    def __init__(self, model: nn.Module, device=None, c=10, r=10, k=50, momentum=1.0):
+    def __init__(self, model: nn.Module, device=None, c=60, r=5, k=60, momentum=1.0, sketchParamsLargerThan=0, sketchBiases=False):
+        self.device = device
+        
+        for p in model.parameters():
+            p.do_sketching = p.numel() >= sketchParamsLargerThan
+           
+        for m in model.modules():
+            if hasattr(m, "bias") and m.bias is not None:
+                m.bias.do_sketching = sketchBiases
+
         grad_shape = 0
+        sketch_shape = 0
+        sketchMask = []
         for p in model.parameters():
             if p.requires_grad:
-                grad_shape += torch.numel(p)
-        self.device = device
+                size = torch.numel(p)
+                grad_shape += size
+                if p.do_sketching:
+                    sketchMask.append(torch.ones(size))
+                    sketch_shape += size
+                else:
+                    sketchMask.append(torch.zeros(size))
+
+        sketchMask = torch.cat(sketchMask).bool().to(self.device) 
+        assert sketchMask.numel() == grad_shape
+        self.sketchMask = sketchMask
+        self.grad_shape = grad_shape
+        self.sketch_shape = sketch_shape
+
         self.u = torch.zeros(grad_shape, device=device)
         self.v = torch.zeros(grad_shape, device=device)
         self.momentum = momentum
-        self.sketch = CSVec(d=grad_shape, c=c, r=r, device=device)
+        self.sketch = CSVec(d=sketch_shape, c=c, r=r, device=device)
         self.k = k
+        self.r = r
+        self.c = c
+
 
     def encode(self, gradient):
         self.u.mul_(self.momentum)
@@ -29,16 +55,37 @@ class SketchState:
 
         self.v.add_(self.u)
 
-        self.sketch.zero()
-        self.sketch.accumulateVec(self.v)
-        return self.sketch.table.clone() 
+        v_masked = self.v[self.sketchMask]
 
-    def decode(self, sketch_table):
+        self.sketch.zero()
+        self.sketch.accumulateVec(v_masked)
+        table = self.sketch.table.clone()
+
+        uncompressed = self.v[~self.sketchMask]
+        assert uncompressed.size() == torch.Size([self.grad_shape - self.sketch_shape])
+
+        return torch.cat([table.view(-1), uncompressed])
+
+    def decode(self, payload):
+        table_len = self.r * self.c
+        sketch_table = payload[:table_len].view(self.r, self.c)
+        uncompressed = payload[table_len:]
+
+        # deal with compressed gradients
         self.sketch.zero()
         self.sketch.table = sketch_table
-        gradient = self.sketch.unSketch(k=self.k)
+
+        gradient = torch.zeros(self.grad_shape)
+        unsketched = self.sketch.unSketch(k=self.k)
+        gradient[self.sketchMask] = unsketched
+
         self.u[gradient.nonzero()] = 0
         self.v[gradient.nonzero()] = 0
+
+        # deal with non-compressed gradients (bias)
+        assert uncompressed.size() == torch.Size([self.grad_shape - self.sketch_shape])
+        gradient[~self.sketchMask] = uncompressed
+        self.v[~self.sketchMask] = 0
 
         return gradient
 
@@ -51,7 +98,7 @@ def example(rank, world_size, device="cpu"):
     setup(rank, world_size)
     print(f"init rank {rank}")
     # create local model
-    model = nn.Linear(10, 10)
+    model = torch.nn.Sequential(torch.nn.Linear(200, 1))
     # construct DDP model
     ddp_model = DDP(model)
 
@@ -79,15 +126,16 @@ def example(rank, world_size, device="cpu"):
     ddp_model.register_comm_hook(state=state, hook=encode_and_decode)
 
     # prepare sample dataset
-    X = torch.randn(20, 10)
-    y = torch.randn(20, 10)
-
+    X = torch.randn(1000, 200)
+    #y = torch.randn(20, 10)
+    y = torch.zeros(1000, 1)
+    
     # define loss function and optimizer
     loss_fn = nn.MSELoss()
     # important: do not use momentum in the optimizer, already handled.
-    optimizer = optim.SGD(ddp_model.parameters(), lr=0.001)
+    optimizer = optim.SGD(ddp_model.parameters(), lr=0.0001)
 
-    for i in range(20):
+    for i in range(100):
         optimizer.zero_grad()
 
         # forward pass
@@ -104,7 +152,7 @@ def example(rank, world_size, device="cpu"):
         optimizer.step()
 
 def main():
-    world_size = 2
+    world_size = 1
     mp.spawn(example,
         args=(world_size,),
         nprocs=world_size,
