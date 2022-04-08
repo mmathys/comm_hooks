@@ -12,8 +12,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # hook.
 class SketchState:
     def __init__(self, model: nn.Module, device=None, c=60, r=5, k=60, momentum=1.0, sketchParamsLargerThan=0, sketchBiases=False):
-        self.device = device
-        
         for p in model.parameters():
             p.do_sketching = p.numel() >= sketchParamsLargerThan
            
@@ -21,9 +19,11 @@ class SketchState:
             if hasattr(m, "bias") and m.bias is not None:
                 m.bias.do_sketching = sketchBiases
 
-        grad_shape = 0
-        sketch_shape = 0
-        sketchMask = []
+        
+        grad_shape = 0 # size of the gradient
+        sketch_shape = 0 # size of the gradient which should be sketched
+        sketchMask = [] # controls which parameters should be sketched
+
         for p in model.parameters():
             if p.requires_grad:
                 size = torch.numel(p)
@@ -34,19 +34,21 @@ class SketchState:
                 else:
                     sketchMask.append(torch.zeros(size))
 
-        sketchMask = torch.cat(sketchMask).bool().to(self.device) 
+        sketchMask = torch.cat(sketchMask).bool().to(device) 
         assert sketchMask.numel() == grad_shape
+        assert sketchMask.sum() == sketch_shape
         self.sketchMask = sketchMask
         self.grad_shape = grad_shape
         self.sketch_shape = sketch_shape
 
-        self.u = torch.zeros(grad_shape, device=device)
-        self.v = torch.zeros(grad_shape, device=device)
+        self.device = device
+        self.c = c
+        self.r = r
+        self.k = k
         self.momentum = momentum
         self.sketch = CSVec(d=sketch_shape, c=c, r=r, device=device)
-        self.k = k
-        self.r = r
-        self.c = c
+        self.u = torch.zeros(grad_shape, device=device)
+        self.v = torch.zeros(grad_shape, device=device)
 
 
     def encode(self, gradient):
@@ -95,6 +97,7 @@ def setup(rank, world_size):
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
 def example(rank, world_size, device="cpu"):
+    torch.manual_seed(42)
     setup(rank, world_size)
     print(f"init rank {rank}")
     # create local model
@@ -116,7 +119,8 @@ def example(rank, world_size, device="cpu"):
         # Define the then callback to decode.
         def decode_fut(fut):
             # decode count summed count sketches into a gradient.
-            decoded_tensor = state.decode(fut.value()[0])
+            payload = fut.value()[0]
+            decoded_tensor = state.decode(payload)
             return decoded_tensor
         
         return fut.then(decode_fut)
