@@ -11,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Implements SketchSGD encoding and decoding. This is can be used for the stateful
 # hook.
 class SketchState:
-    def __init__(self, model: nn.Module, device=None, c=60, r=5, k=60, momentum=1.0, sketchParamsLargerThan=0, sketchBiases=False):
+    def __init__(self, model: nn.Module, device=None, c=60, r=5, k=60, momentum=0.0, lr=0.01, sketchParamsLargerThan=0, sketchBiases=False):
         for p in model.parameters():
             p.do_sketching = p.numel() >= sketchParamsLargerThan
            
@@ -46,6 +46,7 @@ class SketchState:
         self.r = r
         self.k = k
         self.momentum = momentum
+        self.lr = lr
         self.sketch = CSVec(d=sketch_shape, c=c, r=r, device=device)
         self.u = torch.zeros(grad_shape, device=device)
         self.v = torch.zeros(grad_shape, device=device)
@@ -89,6 +90,9 @@ class SketchState:
         gradient[~self.sketchMask] = uncompressed
         self.v[~self.sketchMask] = 0
 
+        # TODO: learning rate
+        gradient.mul_(self.lr)
+
         return gradient
 
 def setup(rank, world_size):
@@ -126,7 +130,7 @@ def example(rank, world_size, device="cpu"):
         return fut.then(decode_fut)
     
     # initialize the state 
-    state = SketchState(model, device=device)
+    state = SketchState(ddp_model, device=device)
     ddp_model.register_comm_hook(state=state, hook=encode_and_decode)
 
     # prepare sample dataset
@@ -137,7 +141,7 @@ def example(rank, world_size, device="cpu"):
     # define loss function and optimizer
     loss_fn = nn.MSELoss()
     # important: do not use momentum in the optimizer, already handled.
-    optimizer = optim.SGD(ddp_model.parameters(), lr=0.0001)
+    optimizer = optim.SGD(ddp_model.parameters(), lr=1)
 
     for i in range(100):
         optimizer.zero_grad()
