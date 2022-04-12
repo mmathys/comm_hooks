@@ -10,7 +10,7 @@ y = torch.zeros(1000, 1)
 
 model = torch.nn.Sequential(torch.nn.Linear(200, 1))
 
-opt = torch.optim.SGD(model.parameters(), momentum=0, lr=0.0001)
+opt = torch.optim.SGD(model.parameters(), momentum=0, lr=0.01)
 
 loss_fn = nn.MSELoss()
 
